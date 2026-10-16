@@ -1,0 +1,823 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: 0BSD
+#
+# weatherpin — pin a place to GNOME Weather by searching for it.
+#
+# Type a place name, confirm the match, and weatherpin looks up the coordinates
+# (OpenStreetMap Nominatim) and adds the location to GNOME Weather's settings.
+# Works with the native app and the Flatpak (org.gnome.Weather).
+#
+# Run `weatherpin --check` to verify prerequisites, or `weatherpin --dry-run`
+# to try the whole flow without changing anything.
+
+# Fail early and clearly on shells/versions that can't run this script.
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+  echo "weatherpin needs bash 4.0 or newer (found: ${BASH_VERSION:-not bash}). Run it with: bash weatherpin" >&2
+  exit 1
+fi
+
+shopt -s extglob
+
+PROG="weatherpin"
+VERSION="0.1.0"
+SCHEMA="org.gnome.Weather"
+GS_KEY="locations"
+APP_ID="org.gnome.Weather"
+GEOCODER_URL="${WEATHERPIN_GEOCODER_URL:-https://nominatim.openstreetmap.org/search}"
+FUZZY_URL="${WEATHERPIN_FUZZY_URL:-https://photon.komoot.io/api/}"
+USER_AGENT="${PROG}/${VERSION} (https://github.com/e1dred/weatherpin)"
+MAX_RESULTS=5
+MIN_COLS=56
+MIN_ROWS=22
+
+DRY_RUN=false
+NO_RESTART=false
+CHECK_ONLY=false
+INITIAL_QUERY=""
+
+# ───────────────────────────── arguments ─────────────────────────────
+
+usage() {
+  cat <<EOF
+$PROG $VERSION — pin a place to GNOME Weather by searching for it
+
+Usage: $PROG [options] [place name]
+
+Options:
+  -c, --check       Check that all prerequisites are installed, then exit
+  -n, --dry-run     Run the whole flow but don't write anything or restart the app
+      --no-restart  Write locations but don't restart GNOME Weather afterwards
+  -h, --help        Show this help
+  -V, --version     Show the version
+
+Environment:
+  NO_COLOR                   Disable colours
+  WEATHERPIN_GEOCODER_URL    Override the Nominatim-compatible search endpoint
+  WEATHERPIN_FUZZY_URL       Override the Photon-compatible "did you mean" endpoint
+
+Examples:
+  $PROG
+  $PROG "Northampton, MA"
+  $PROG --dry-run Berlin
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -c|--check)    CHECK_ONLY=true ;;
+    -n|--dry-run)  DRY_RUN=true ;;
+    --no-restart)  NO_RESTART=true ;;
+    -h|--help)     usage; exit 0 ;;
+    -V|--version)  echo "$PROG $VERSION"; exit 0 ;;
+    --)            shift; INITIAL_QUERY="$*"; break ;;
+    -*)            echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+    *)             INITIAL_QUERY="${INITIAL_QUERY:+$INITIAL_QUERY }$1" ;;
+  esac
+  shift
+done
+
+# ───────────────────────────── styling ─────────────────────────────
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
+  RST=$'\e[0m';  BOLD=$'\e[1m'
+  ACCENT=$'\e[38;5;75m'   # sky blue
+  HI=$'\e[38;5;255m'      # near-white
+  MUTED=$'\e[38;5;245m'   # grey
+  BORDER=$'\e[38;5;61m'   # slate violet
+  OK=$'\e[38;5;114m'      # green
+  WARN=$'\e[38;5;221m'    # amber
+  ERR=$'\e[38;5;203m'     # red
+  SUN=$'\e[38;5;220m'     # sun body
+  RAY=$'\e[38;5;208m'     # sun rays
+else
+  RST='' BOLD='' ACCENT='' HI='' MUTED='' BORDER='' OK='' WARN='' ERR='' SUN='' RAY=''
+fi
+
+PAD="  "
+TW=64            # total box width (set by term_size)
+COLS=80 ROWS=24
+IN_ALT=false
+TMPFILE=""
+BG_PID=""
+ERRMSG=""
+NOTICE=""
+ADDED=()
+
+# US state name → postal abbreviation
+declare -A US_STATES=(
+  ["Alabama"]=AL ["Alaska"]=AK ["Arizona"]=AZ ["Arkansas"]=AR ["California"]=CA
+  ["Colorado"]=CO ["Connecticut"]=CT ["Delaware"]=DE ["Florida"]=FL ["Georgia"]=GA
+  ["Hawaii"]=HI ["Idaho"]=ID ["Illinois"]=IL ["Indiana"]=IN ["Iowa"]=IA
+  ["Kansas"]=KS ["Kentucky"]=KY ["Louisiana"]=LA ["Maine"]=ME ["Maryland"]=MD
+  ["Massachusetts"]=MA ["Michigan"]=MI ["Minnesota"]=MN ["Mississippi"]=MS
+  ["Missouri"]=MO ["Montana"]=MT ["Nebraska"]=NE ["Nevada"]=NV ["New Hampshire"]=NH
+  ["New Jersey"]=NJ ["New Mexico"]=NM ["New York"]=NY ["North Carolina"]=NC
+  ["North Dakota"]=ND ["Ohio"]=OH ["Oklahoma"]=OK ["Oregon"]=OR ["Pennsylvania"]=PA
+  ["Rhode Island"]=RI ["South Carolina"]=SC ["South Dakota"]=SD ["Tennessee"]=TN
+  ["Texas"]=TX ["Utah"]=UT ["Vermont"]=VT ["Virginia"]=VA ["Washington"]=WA
+  ["West Virginia"]=WV ["Wisconsin"]=WI ["Wyoming"]=WY ["District of Columbia"]=DC
+  ["Puerto Rico"]=PR ["Guam"]=GU ["American Samoa"]=AS
+  ["Northern Mariana Islands"]=MP ["United States Virgin Islands"]=VI
+)
+
+enter_screen() { printf '\e[?1049h\e[?25l'; IN_ALT=true; }
+leave_screen() { if $IN_ALT; then printf '\e[?25h\e[?1049l'; IN_ALT=false; fi; return 0; }
+cleanup() {
+  [ -n "$BG_PID" ] && kill "$BG_PID" 2>/dev/null
+  leave_screen
+  [ -n "$TMPFILE" ] && rm -f "$TMPFILE"
+  return 0
+}
+trap cleanup EXIT
+trap 'finish 130' INT TERM
+
+term_size() {
+  local r c
+  if read -r r c < <(stty size 2>/dev/null) && [ -n "${c:-}" ] && [ "$c" -gt 0 ]; then ROWS=$r; COLS=$c; fi
+  TW=$(( COLS - 4 ))
+  (( TW > 72 )) && TW=72
+  (( TW < 52 )) && TW=52
+}
+
+# rep N CHAR  → $REP
+rep() { local n=$1 s; (( n < 0 )) && n=0; printf -v s '%*s' "$n" ''; REP=${s// /$2}; }
+
+# trunc STRING MAX → $TR
+trunc() {
+  local s=$1 max=$2
+  (( max < 4 )) && max=4
+  if (( ${#s} > max )); then TR="${s:0:max-1}…"; else TR=$s; fi
+}
+
+blank() { printf '\e[K\n'; }
+emit()  { printf '%s%s\e[K\n' "$PAD" "$1"; }
+
+box_top() {
+  local title=${1:-}
+  if [ -n "$title" ]; then
+    rep $(( TW - ${#title} - 5 )) '─'
+    printf '%s%s╭─ %s%s%s%s %s╮%s\e[K\n' "$PAD" "$BORDER" "$BOLD$HI" "$title" "$RST" "$BORDER" "$REP" "$RST"
+  else
+    rep $(( TW - 2 )) '─'
+    printf '%s%s╭%s╮%s\e[K\n' "$PAD" "$BORDER" "$REP" "$RST"
+  fi
+}
+
+box_bottom() {
+  rep $(( TW - 2 )) '─'
+  printf '%s%s╰%s╯%s\e[K\n' "$PAD" "$BORDER" "$REP" "$RST"
+}
+
+# box_split LEFT RIGHT — one row with LEFT flush-left and RIGHT flush-right
+box_split() {
+  local l=$1 r=$2 lp rp gap
+  lp=${l//$'\e'\[*([0-9;])m/}
+  rp=${r//$'\e'\[*([0-9;])m/}
+  gap=$(( TW - 4 - ${#lp} - ${#rp} )); (( gap < 1 )) && gap=1
+  printf '%s%s│%s %s%*s%s %s│%s\e[K\n' "$PAD" "$BORDER" "$RST" "$l" "$gap" '' "$r" "$BORDER" "$RST"
+}
+
+box_row() { box_split "$1" ""; }
+
+# hints KEY LABEL [KEY LABEL ...]
+hints() {
+  local out=""
+  while [ $# -ge 2 ]; do out+="${ACCENT}$1${RST} ${MUTED}$2${RST}   "; shift 2; done
+  emit "$out"
+}
+
+# sun_row 1..5 → $SUNROW  (13 columns wide)
+sun_row() {
+  case $1 in
+    1) SUNROW="${RAY}"$'  \\   |   /  '"${RST}" ;;
+    2) SUNROW="${SUN}"$'   .-----.   '"${RST}" ;;
+    3) SUNROW="${RAY}-- ${SUN}(     )${RAY} --${RST}" ;;
+    4) SUNROW="${SUN}"$'   `-----\'   '"${RST}" ;;
+    5) SUNROW="${RAY}"$'  /   |   \\  '"${RST}" ;;
+  esac
+}
+
+# render_header STEP(1-4)
+render_header() {
+  local step=$1 i out="" names=(Search Select Confirm Add)
+  term_size
+  for i in 0 1 2 3; do
+    if   (( i + 1 < step )); then  out+="${OK}✔ ${names[i]}${RST}"
+    elif (( i + 1 == step )); then out+="${ACCENT}${BOLD}● ${names[i]}${RST}"
+    else                           out+="${MUTED}○ ${names[i]}${RST}"
+    fi
+    (( i < 3 )) && out+="${MUTED}  ›  ${RST}"
+  done
+  printf '\e[H'
+  box_top ""
+  if (( TW >= 66 )); then
+    sun_row 1; box_split ""                                                        "$SUNROW"
+    sun_row 2; box_split "${ACCENT}${BOLD}weatherpin${RST} ${MUTED}v${VERSION}${RST}" "$SUNROW"
+    sun_row 3; box_split "${MUTED}pin a place to GNOME Weather${RST}"                "$SUNROW"
+    sun_row 4; box_split ""                                                        "$SUNROW"
+    sun_row 5; box_split "$out"                                                    "$SUNROW"
+  else
+    box_row "${ACCENT}${BOLD}weatherpin${RST} ${MUTED}v${VERSION} · pin a place${RST}"
+    box_row "$out"
+  fi
+  box_bottom
+}
+
+spin() { # spin PID MESSAGE
+  local pid=$1 msg=$2 i=0 frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+  while kill -0 "$pid" 2>/dev/null; do
+    printf '\r%s%s%s%s %s\e[K' "$PAD" "$ACCENT" "${frames[i % 10]}" "$RST" "$msg"
+    i=$(( i + 1 )); sleep 0.08
+  done
+  printf '\r\e[K'
+}
+
+# read_key → $KEY  (up down left right enter esc eof, or the literal character)
+read_key() {
+  local k rest
+  IFS= read -rsn1 k || { KEY=eof; return; }
+  case "$k" in
+    $'\e')
+      if IFS= read -rsn2 -t 0.1 rest; then
+        case "$rest" in
+          '[A'|'OA') KEY=up ;;    '[B'|'OB') KEY=down ;;
+          '[C'|'OC') KEY=right ;; '[D'|'OD') KEY=left ;;
+          *)         KEY=other ;;
+        esac
+      else
+        KEY=esc
+      fi ;;
+    '') KEY=enter ;;
+    *)  KEY=$k ;;
+  esac
+}
+
+# ───────────────────────────── helpers ─────────────────────────────
+
+to_rad()    { LC_ALL=C awk -v d="$1" 'BEGIN { printf "%.10f", d * atan2(0, -1) / 180 }'; }
+fmt_coord() { LC_ALL=C awk -v v="$1" -v p="$2" -v n="$3" 'BEGIN { printf "%.4f° %s", (v < 0 ? -v : v), (v < 0 ? n : p) }'; }
+
+RL_PROMPT=$'  \001'"${ACCENT}"$'\002❯\001'"${RST}"$'\002 '
+RL_NAME_PROMPT=$'  \001'"${MUTED}"$'\002Name\001'"${RST}"$'\002 \001'"${ACCENT}"$'\002❯\001'"${RST}"$'\002 '
+
+trim() { # trim STRING → $TRIMMED  (also strips control characters)
+  local s=$1
+  s=${s//[[:cntrl:]]/}
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  TRIMMED=$s
+}
+
+# ───────────────────────────── prerequisites ─────────────────────────────
+
+FAIL_COUNT=0 WARN_COUNT=0
+REPORT=""
+NEED=()          # missing items, as package keys
+PM="" PM_CMD=""
+
+detect_pm() {
+  local id="" like=""
+  if [ -r /etc/os-release ]; then
+    id=$( . /etc/os-release; printf '%s' "${ID:-}" )
+    like=$( . /etc/os-release; printf '%s' "${ID_LIKE:-}" )
+  fi
+  case " $id $like " in
+    *" fedora "*|*" rhel "*|*" centos "*)          PM=dnf;    PM_CMD="sudo dnf install" ;;
+    *" debian "*|*" ubuntu "*)                     PM=apt;    PM_CMD="sudo apt install" ;;
+    *" arch "*)                                    PM=pacman; PM_CMD="sudo pacman -S" ;;
+    *" suse "*|*" opensuse "*|*" sles "*)          PM=zypper; PM_CMD="sudo zypper install" ;;
+    *" alpine "*)                                  PM=apk;    PM_CMD="sudo apk add" ;;
+    *)                                             PM="";     PM_CMD="" ;;
+  esac
+}
+
+pkg_for() { # item → package name for the detected package manager
+  case "$1" in
+    awk)           echo gawk ;;
+    coreutils)     echo coreutils ;;
+    gsettings)     case "$PM" in apt) echo libglib2.0-bin ;; zypper) echo glib2-tools ;; apk) echo glib ;; *) echo glib2 ;; esac ;;
+    gnome-weather) echo gnome-weather ;;
+    *)             echo "$1" ;;
+  esac
+}
+
+# chk ok|warn|fail LABEL DETAIL
+chk() {
+  case "$1" in
+    ok)   REPORT+="$(printf '  %s✔%s %-16s %s%s%s' "$OK" "$RST" "$2" "$MUTED" "${3:-}" "$RST")"$'\n' ;;
+    warn) REPORT+="$(printf '  %s!%s %-16s %s' "$WARN" "$RST" "$2" "${3:-}")"$'\n'; WARN_COUNT=$(( WARN_COUNT + 1 )) ;;
+    fail) REPORT+="$(printf '  %s✖%s %-16s %s' "$ERR" "$RST" "$2" "${3:-}")"$'\n'; FAIL_COUNT=$(( FAIL_COUNT + 1 )) ;;
+  esac
+}
+
+check_cmd() { # check_cmd COMMAND PACKAGE-KEY
+  if command -v "$1" >/dev/null 2>&1; then chk ok "$1" "found"
+  else chk fail "$1" "not found"; NEED+=("$2"); fi
+}
+
+run_checks() {
+  REPORT=""; FAIL_COUNT=0; WARN_COUNT=0; NEED=()
+  detect_pm
+
+  chk ok "bash" "$BASH_VERSION"
+  check_cmd curl curl
+  check_cmd jq jq
+  check_cmd awk awk
+  check_cmd stty coreutils
+  check_cmd mktemp coreutils
+
+  # Terminal: UTF-8 locale (box drawing and alignment depend on it)
+  local cm; cm=$(locale charmap 2>/dev/null)
+  if [ "$cm" = "UTF-8" ]; then chk ok "UTF-8 locale" "$cm"
+  else chk fail "UTF-8 locale" "locale is '${cm:-unknown}' — try: export LC_ALL=C.UTF-8"; fi
+
+  # Terminal: interactive and big enough (skipped for --check so it works in pipes)
+  if ! $CHECK_ONLY; then
+    if [ -t 0 ] && [ -t 1 ]; then
+      term_size
+      if (( COLS >= MIN_COLS && ROWS >= MIN_ROWS )); then chk ok "terminal" "${COLS}×${ROWS}"
+      else chk fail "terminal" "${COLS}×${ROWS} is too small — need at least ${MIN_COLS}×${MIN_ROWS}"; fi
+    else
+      chk fail "terminal" "not interactive — run weatherpin directly in a terminal"
+    fi
+  fi
+
+  # GNOME Weather and its settings backend
+  IS_FLATPAK=false; HAVE_BACKEND=false; BACKEND="none"; GSET=(); CURRENT_LOCS=""
+  local have_gsettings=false
+  command -v gsettings >/dev/null 2>&1 && have_gsettings=true
+
+  if command -v flatpak >/dev/null 2>&1 && flatpak info "$APP_ID" >/dev/null 2>&1; then
+    IS_FLATPAK=true; BACKEND="Flatpak"
+    GSET=(flatpak run --command=gsettings "$APP_ID")
+  elif $have_gsettings; then
+    BACKEND="native"
+    GSET=(gsettings)
+  fi
+
+  if ! $IS_FLATPAK; then
+    if $have_gsettings; then chk ok "gsettings" "found"
+    else chk fail "gsettings" "not found"; NEED+=(gsettings); fi
+  fi
+
+  if [ ${#GSET[@]} -gt 0 ] && CURRENT_LOCS=$("${GSET[@]}" get "$SCHEMA" "$GS_KEY" 2>/dev/null); then
+    HAVE_BACKEND=true
+    chk ok "GNOME Weather" "$BACKEND"
+  elif $IS_FLATPAK; then
+    chk fail "GNOME Weather" "Flatpak is installed but its settings couldn't be read"
+  elif $DRY_RUN; then
+    chk warn "GNOME Weather" "not found — continuing because of --dry-run"
+    BACKEND="none (dry run)"
+  else
+    chk fail "GNOME Weather" "not found (settings schema $SCHEMA is missing)"
+    NEED+=(gnome-weather)
+  fi
+}
+
+print_report() {
+  local pkgs=() seen=" " item p
+  printf '\n%s%s%s %s— prerequisite check%s\n\n' "$BOLD" "$PROG" "$RST" "$MUTED" "$RST"
+  printf '%s' "$REPORT"
+  printf '\n'
+  if (( FAIL_COUNT == 0 )); then
+    printf '%sAll set.%s\n\n' "$OK" "$RST"
+    return
+  fi
+  printf '%s%d prerequisite problem(s) found.%s\n' "$ERR" "$FAIL_COUNT" "$RST"
+  for item in "${NEED[@]}"; do
+    p=$(pkg_for "$item")
+    [[ $seen == *" $p "* ]] && continue
+    seen+="$p "; pkgs+=("$p")
+  done
+  if [ ${#pkgs[@]} -gt 0 ]; then
+    if [ -n "$PM_CMD" ]; then
+      printf '\nInstall what is missing with:\n\n    %s %s\n' "$PM_CMD" "${pkgs[*]}"
+    else
+      printf '\nInstall these with your package manager: %s\n' "${pkgs[*]}"
+      printf '%s(package names can differ between distributions)%s\n' "$MUTED" "$RST"
+    fi
+    if [[ $seen == *" gnome-weather "* ]]; then
+      printf '\nOr install GNOME Weather from Flathub:\n\n    flatpak install flathub org.gnome.Weather\n'
+    fi
+  fi
+  printf '\n'
+}
+
+# ───────────────────────────── search ─────────────────────────────
+
+R_PLACE=(); R_SUB=(); R_SHOWN=(); R_LAT=(); R_LON=(); R_TYPE=()
+SUGGESTED=false
+
+# jq filters → one row per place: name, city, state, country, display, lat, lon, type, country_code
+JQ_NOMINATIM='
+  if type == "array" then .[] else empty end
+  | [ (.name // ""),
+      (.address.city // .address.town // .address.village // .address.hamlet
+         // .address.municipality // .address.county // ""),
+      (.address.state // .address.region // ""),
+      (.address.country // ""),
+      (.display_name // ""),
+      (.lat // ""), (.lon // ""),
+      (.addresstype // .type // ""),
+      (.address.country_code // "") ]
+  | map(tostring | gsub("[\\x01-\\x1f]"; " "))
+  | join("\u001f")'
+
+JQ_PHOTON='
+  (.features // [])[]
+  | (.properties // {}) as $p
+  | [ ($p.name // ""),
+      "",
+      ($p.state // ""),
+      ($p.country // ""),
+      ([$p.name, $p.state, $p.country] | map(select(. != null)) | join(", ")),
+      (.geometry.coordinates[1] // ""),
+      (.geometry.coordinates[0] // ""),
+      ($p.osm_value // $p.type // ""),
+      ($p.countrycode // "") ]
+  | map(tostring | gsub("[\\x01-\\x1f]"; " "))
+  | join("\u001f")'
+
+# http_get MESSAGE URL [curl args...]  — runs curl with a spinner, output → $TMPFILE
+http_get() {
+  local msg=$1 url=$2 rc; shift 2
+  : >"$TMPFILE"
+  curl -fsS --max-time 15 -G -A "$USER_AGENT" "$@" "$url" >"$TMPFILE" 2>/dev/null &
+  BG_PID=$!
+  render_header 1; blank; printf '\e[J'
+  spin "$BG_PID" "$msg"
+  wait "$BG_PID"; rc=$?
+  BG_PID=""
+  return $rc
+}
+
+# ingest HINT < rows — append parsed places to R_* arrays (US states abbreviated).
+# Results whose state/country contain HINT are listed first.
+ingest() {
+  local hint=${1,,} name city state country display lat lon type cc
+  local place sub shown st k pri hay pass i
+  local -A seen=()
+  local -a tp=() ts=() tsh=() tla=() tlo=() tty=() tpri=()
+
+  while IFS=$'\x1f' read -r name city state country display lat lon type cc; do
+    [[ $lat =~ ^-?[0-9]+(\.[0-9]+)?$ && $lon =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || continue
+    cc=${cc,,}
+    place=${name:-$city}
+    [ -n "$place" ] || place=${display%%,*}
+    [ -n "$place" ] || continue
+
+    k="$place|$state|$country"
+    [ -n "${seen[$k]:-}" ] && continue
+    seen[$k]=1
+
+    st=$state
+    [ "$cc" = us ] && st=${US_STATES[$state]:-$state}
+
+    sub=""
+    [ -n "$state" ]   && [ "$state"   != "$place" ] && sub=$st
+    [ -n "$country" ] && [ "$country" != "$place" ] && sub+="${sub:+, }$country"
+    [ -n "$sub" ] || sub=$display
+
+    shown=$place
+    if   [ -n "$state" ]   && [ "$state"   != "$place" ]; then shown+=", $st"
+    elif [ -n "$country" ] && [ "$country" != "$place" ]; then shown+=", $country"
+    fi
+
+    pri=0
+    if [ -n "$hint" ]; then hay="${state,,} ${country,,}"; [[ $hay == *"$hint"* ]] && pri=1; fi
+
+    tp+=("$place"); ts+=("$sub"); tsh+=("$shown"); tla+=("$lat"); tlo+=("$lon")
+    tty+=("${type:-place}"); tpri+=("$pri")
+  done
+
+  for pass in 1 0; do
+    for i in "${!tp[@]}"; do
+      [ "${tpri[i]}" = "$pass" ] || continue
+      (( ${#R_PLACE[@]} >= MAX_RESULTS )) && break 2
+      R_PLACE+=("${tp[i]}"); R_SUB+=("${ts[i]}"); R_SHOWN+=("${tsh[i]}")
+      R_LAT+=("${tla[i]}"); R_LON+=("${tlo[i]}"); R_TYPE+=("${tty[i]}")
+    done
+  done
+}
+
+# prompt_query → sets QUERY.  Returns 0 ok, 1 quit, 2 empty input
+prompt_query() {
+  local input
+  render_header 1
+  blank
+  emit "${BOLD}${HI}Where would you like weather for?${RST}"
+  emit "${MUTED}Enter a city, region or place — e.g. “Northampton, MA”${RST}"
+  blank
+  if [ -n "$NOTICE" ]; then emit "${OK}✔${RST} $NOTICE"; blank; NOTICE=""; fi
+  if [ -n "$ERRMSG" ]; then emit "${ERR}✖${RST} $ERRMSG"; blank; ERRMSG=""; fi
+  hints "⏎" "search" "ctrl-c" "quit"
+  blank
+  printf '\e[J\e[?25h'
+  if ! IFS= read -e -r -p "$RL_PROMPT" -i "$QUERY" input; then
+    printf '\e[?25l'; return 1
+  fi
+  printf '\e[?25l'
+  trim "$input"
+  QUERY=$TRIMMED
+  [ -n "$QUERY" ] || { ERRMSG="Please enter a place name."; return 2; }
+  return 0
+}
+
+# run_search → fills R_* arrays. 0 ok, 1 network/service error, 2 no results
+run_search() {
+  local lang first rest attempt
+  lang=${LANG%%[_.@]*}; [[ $lang =~ ^[a-z]{2,3}$ ]] || lang=en
+  R_PLACE=(); R_SUB=(); R_SHOWN=(); R_LAT=(); R_LON=(); R_TYPE=()
+  SUGGESTED=false
+
+  if ! http_get "Searching for ${BOLD}${QUERY}${RST}…" "$GEOCODER_URL" \
+        --data-urlencode "q=$QUERY" --data-urlencode "format=jsonv2" \
+        --data-urlencode "limit=8" --data-urlencode "addressdetails=1" \
+        --data-urlencode "accept-language=$lang"; then
+    ERRMSG="Couldn't reach the search service. Check your connection and try again."
+    return 1
+  fi
+  ingest "" < <(jq -r "$JQ_NOMINATIM" "$TMPFILE" 2>/dev/null)
+  (( ${#R_PLACE[@]} > 0 )) && return 0
+
+  # No exact match: try a typo-tolerant search ("did you mean…").
+  first=${QUERY%%,*}; rest=""
+  [[ $QUERY == *,* ]] && rest=${QUERY#*,}
+  trim "$first"; first=$TRIMMED
+  trim "$rest";  rest=$TRIMMED
+
+  for attempt in "$QUERY" "$first"; do
+    if http_get "No exact match — looking for close matches…" "$FUZZY_URL" \
+         --data-urlencode "q=$attempt" --data-urlencode "limit=10" \
+         --data-urlencode "osm_tag=place"; then
+      ingest "$rest" < <(jq -r "$JQ_PHOTON" "$TMPFILE" 2>/dev/null)
+      if (( ${#R_PLACE[@]} > 0 )); then SUGGESTED=true; return 0; fi
+    fi
+    [ "$first" = "$QUERY" ] && break
+  done
+
+  ERRMSG="No matches for “${QUERY}”, and no close matches either. Check the spelling or add a region."
+  return 2
+}
+
+# ───────────────────────────── select / confirm ─────────────────────────────
+
+# select_result START_INDEX → $SEL.  Returns 0 chosen, 1 new search, 2 quit
+select_result() {
+  local n=${#R_PLACE[@]} idx=${1:-0} i name sub plural=s
+  (( n == 1 )) && plural=""
+  while :; do
+    render_header 2
+    blank
+    if $SUGGESTED; then
+      trunc "No exact match for “${QUERY}” — did you mean…" $(( TW - 2 ))
+      emit "${WARN}${TR}${RST}"
+    else
+      emit "${BOLD}${HI}Select the right place${RST}  ${MUTED}($n result${plural})${RST}"
+    fi
+    blank
+    for (( i = 0; i < n; i++ )); do
+      trunc "${R_PLACE[i]}" $(( TW - 6 )); name=$TR
+      trunc "${R_SUB[i]}"   $(( TW - 6 )); sub=$TR
+      if (( i == idx )); then
+        emit "${ACCENT}┃${RST} ${BOLD}${ACCENT}${name}${RST}"
+        emit "${ACCENT}┃${RST} ${MUTED}${sub}${RST}"
+      else
+        emit "  ${name}"
+        emit "  ${MUTED}${sub}${RST}"
+      fi
+    done
+    blank
+    hints "↑/↓" "move" "⏎" "select" "/" "search again" "q" "quit"
+    printf '\e[J'
+    read_key
+    case "$KEY" in
+      up|k)             (( idx = (idx - 1 + n) % n )) ;;
+      down|j)           (( idx = (idx + 1) % n )) ;;
+      enter|right|l)    SEL=$idx; return 0 ;;
+      '/'|s|esc|left)   return 1 ;;
+      q|Q|eof)          return 2 ;;
+    esac
+  done
+}
+
+# confirm_result INDEX → sets LAT LON DISPLAY_NAME.  Returns 0 yes, 1 back, 2 quit
+confirm_result() {
+  local i=$1 sub name shown newname
+  LAT=${R_LAT[i]}; LON=${R_LON[i]}; DISPLAY_NAME=${R_SHOWN[i]}
+  while :; do
+    render_header 3
+    blank
+    trunc "${R_PLACE[i]}" $(( TW - 6 )); name=$TR
+    trunc "${R_SUB[i]}"   $(( TW - 6 )); sub=$TR
+    trunc "$DISPLAY_NAME" $(( TW - 20 )); shown=$TR
+    box_top "Is this the right place?"
+    box_row ""
+    box_row "${BOLD}${HI}${name}${RST}"
+    box_row "${MUTED}${sub}${RST}"
+    box_row ""
+    box_row "${MUTED}Latitude     ${RST} $(fmt_coord "$LAT" N S)"
+    box_row "${MUTED}Longitude    ${RST} $(fmt_coord "$LON" E W)"
+    box_row "${MUTED}Type         ${RST} ${R_TYPE[i]}"
+    box_row "${MUTED}Shown as     ${RST} ${ACCENT}${shown}${RST}"
+    box_row ""
+    box_bottom
+    blank
+    hints "y/⏎" "add it" "e" "rename" "n" "not this one" "q" "quit"
+    printf '\e[J'
+    read_key
+    case "$KEY" in
+      y|Y|enter)         return 0 ;;
+      n|N|esc|left|b)    return 1 ;;
+      q|Q|eof)           return 2 ;;
+      e|E)
+        blank
+        printf '\e[J\e[?25h'
+        if IFS= read -e -r -p "$RL_NAME_PROMPT" -i "$DISPLAY_NAME" newname; then
+          trim "$newname"
+          [ -n "$TRIMMED" ] && DISPLAY_NAME=$TRIMMED
+        fi
+        printf '\e[?25l' ;;
+    esac
+  done
+}
+
+# ───────────────────────────── add / finish ─────────────────────────────
+
+weather_running() {
+  if $IS_FLATPAK; then
+    flatpak ps --columns=application 2>/dev/null | grep -qx "$APP_ID"
+  else
+    pgrep -f 'gnome-weather' >/dev/null 2>&1
+  fi
+}
+
+restart_weather() {
+  if $IS_FLATPAK; then
+    flatpak kill "$APP_ID" >/dev/null 2>&1
+    sleep 0.5
+    ( setsid flatpak run "$APP_ID" >/dev/null 2>&1 & )
+  else
+    pkill -f 'gnome-weather' >/dev/null 2>&1
+    sleep 0.5
+    if command -v gnome-weather >/dev/null 2>&1; then
+      ( setsid gnome-weather >/dev/null 2>&1 & )
+    fi
+  fi
+}
+
+ADD_STATUS=""
+ADD_ERR=""
+
+# do_add — write the chosen location. Returns 0 normally, 1 if the write failed.
+do_add() {
+  local lat_rad lon_rad esc entry updated err
+
+  render_header 4
+  blank
+
+  lat_rad=$(to_rad "$LAT"); lon_rad=$(to_rad "$LON")
+  emit "${OK}✔${RST} Converted coordinates"
+
+  # Escape for a GVariant string literal; passed as one argument (never eval'd).
+  esc=${DISPLAY_NAME//\\/\\\\}
+  esc=${esc//\'/\\\'}
+  entry="<(uint32 2, <('$esc', '', false, [($lat_rad, $lon_rad)], @a(dd) [])>)>"
+
+  if $HAVE_BACKEND; then
+    CURRENT_LOCS=$("${GSET[@]}" get "$SCHEMA" "$GS_KEY" 2>/dev/null) || CURRENT_LOCS=""
+  else
+    CURRENT_LOCS="@av []"
+  fi
+
+  if [[ $CURRENT_LOCS == *"[($lat_rad, $lon_rad)]"* ]]; then
+    emit "${WARN}!${RST} Already in your list — nothing to add"
+    ADD_STATUS="duplicate"
+    return 0
+  fi
+
+  if [ -z "$CURRENT_LOCS" ] || [ "$CURRENT_LOCS" = "@av []" ] || [ "$CURRENT_LOCS" = "[]" ]; then
+    updated="[$entry]"
+  else
+    updated="${CURRENT_LOCS%]}, $entry]"
+  fi
+
+  if $DRY_RUN; then
+    emit "${WARN}◌${RST} Dry run — skipped writing to GSettings"
+    trunc "\$ gsettings set $SCHEMA $GS_KEY '$updated'" $(( TW - 4 ))
+    emit "  ${MUTED}${TR}${RST}"
+    ADD_STATUS="dry"
+  elif err=$("${GSET[@]}" set "$SCHEMA" "$GS_KEY" "$updated" 2>&1); then
+    emit "${OK}✔${RST} Saved to GNOME Weather ${MUTED}(${BACKEND})${RST}"
+    ADD_STATUS="added"
+  else
+    ADD_ERR=$err
+    ADD_STATUS="failed"
+    return 1
+  fi
+  ADDED+=("$DISPLAY_NAME")
+  return 0
+}
+
+# finish [STATUS] — leave the TUI, summarise, restart GNOME Weather once, exit.
+finish() {
+  local status=${1:-0} name
+  cleanup
+  if [ ${#ADDED[@]} -eq 0 ]; then
+    printf '\nNothing was changed.\n'
+    exit "$status"
+  fi
+  if $DRY_RUN; then
+    printf '\n%s◌%s Dry run — nothing was written. Would have added:\n' "$WARN" "$RST"
+  else
+    printf '\n%s✔%s Added to GNOME Weather:\n' "$OK" "$RST"
+  fi
+  for name in "${ADDED[@]}"; do printf '    %s\n' "$name"; done
+  if $DRY_RUN; then
+    :
+  elif $NO_RESTART; then
+    printf '\nRestart GNOME Weather to see the change.\n'
+  elif weather_running; then
+    printf '\nRestarting GNOME Weather… '
+    restart_weather
+    printf 'done.\n'
+  else
+    printf '\nOpen GNOME Weather to see the change.\n'
+  fi
+  printf '\n'
+  exit "$status"
+}
+
+# ───────────────────────────── main ─────────────────────────────
+
+main() {
+  run_checks
+  if $CHECK_ONLY; then
+    print_report
+    exit $(( FAIL_COUNT > 0 ))
+  fi
+  if (( FAIL_COUNT > 0 )); then
+    print_report >&2
+    exit 1
+  fi
+
+  TMPFILE=$(mktemp) || { echo "Couldn't create a temporary file." >&2; exit 1; }
+  enter_screen
+
+  QUERY=$INITIAL_QUERY
+  local state=search idx=0 rc skip_select
+  while :; do
+    case "$state" in
+      search)
+        prompt_query; rc=$?
+        (( rc == 1 )) && finish 0
+        (( rc == 2 )) && continue
+        run_search; rc=$?
+        if (( rc == 0 )); then
+          idx=0
+          if (( ${#R_PLACE[@]} == 1 )) && ! $SUGGESTED; then state=confirm; else state=select; fi
+        fi
+        ;;
+      select)
+        select_result "$idx"; rc=$?
+        case $rc in
+          0) idx=$SEL; state=confirm ;;
+          1) state=search ;;
+          *) finish 0 ;;
+        esac
+        ;;
+      confirm)
+        confirm_result "$idx"; rc=$?
+        case $rc in
+          0)
+            if ! do_add; then
+              leave_screen
+              printf '%s✖%s Couldn'"'"'t update GNOME Weather: %s\n' "$ERR" "$RST" "$ADD_ERR" >&2
+              finish 1
+            fi
+            case "$ADD_STATUS" in
+              added)     NOTICE="Added ${DISPLAY_NAME}. Search for another place below." ;;
+              duplicate) NOTICE="${DISPLAY_NAME} is already in your list." ;;
+              dry)       NOTICE="Dry run: pretended to add ${DISPLAY_NAME}." ;;
+            esac
+            blank
+            emit "${BOLD}${HI}Add another location?${RST}"
+            hints "a/⏎" "add another" "q" "quit"
+            printf '\e[J'
+            while :; do
+              read_key
+              case "$KEY" in
+                a|A|enter)       QUERY=""; state=search; break ;;
+                q|Q|n|N|esc|eof) finish 0 ;;
+              esac
+            done
+            ;;
+          1) if (( ${#R_PLACE[@]} == 1 )) && ! $SUGGESTED; then state=search; else state=select; fi ;;
+          *) finish 0 ;;
+        esac
+        ;;
+    esac
+  done
+}
+
+main
