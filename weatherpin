@@ -19,7 +19,7 @@ fi
 shopt -s extglob
 
 PROG="weatherpin"
-VERSION="0.1.0"
+VERSION="0.1.1"
 SCHEMA="org.gnome.Weather"
 GS_KEY="locations"
 APP_ID="org.gnome.Weather"
@@ -81,11 +81,11 @@ done
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
   RST=$'\e[0m';  BOLD=$'\e[1m'
   ACCENT=$'\e[38;5;75m'   # sky blue
-  HI=$'\e[38;5;255m'      # near-white
+  HI=$'\e[38;5;167m'       # red (readable on light and dark)
   MUTED=$'\e[38;5;245m'   # grey
   BORDER=$'\e[38;5;61m'   # slate violet
   OK=$'\e[38;5;114m'      # green
-  WARN=$'\e[38;5;221m'    # amber
+  WARN=$'\e[38;5;114m'    # green (same as OK)
   ERR=$'\e[38;5;203m'     # red
   SUN=$'\e[38;5;220m'     # sun body
   RAY=$'\e[38;5;208m'     # sun rays
