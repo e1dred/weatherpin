@@ -1,4 +1,4 @@
-# weatherpin
+# weatherpin ☀️
 
 [![License: 0BSD](https://img.shields.io/badge/license-0BSD-blue.svg)](LICENSE)
 [![Shell: Bash 4+](https://img.shields.io/badge/shell-bash%204%2B-4EAA25.svg)](#prerequisites)
@@ -13,7 +13,7 @@ found, and adds it to GNOME Weather. No hunting for latitude and longitude.
   <img src="docs/screenshot.png" alt="weatherpin showing a list of matching places for a search, with a sun icon in the header" width="720">
 </p>
 
-## Features
+## ✨ Features
 
 - **Search by name.** Type `Northampton, MA`; coordinates are looked up for you.
 - **Confirm before anything changes.** Review the match, rename it, or go back.
@@ -24,7 +24,7 @@ found, and adds it to GNOME Weather. No hunting for latitude and longitude.
 - **Safe to try.** `--dry-run` runs the whole flow without writing anything.
 - **Helpful when something's missing.** `--check` tells you exactly what to install.
 
-## Prerequisites
+## ✅ Prerequisites
 
 | Requirement | Why | Package (Fedora / Debian & Ubuntu / Arch) |
 | --- | --- | --- |
@@ -45,7 +45,7 @@ install command for your distribution:
 weatherpin --check
 ```
 
-## Installation
+## 🛠️ Installation
 
 **Quick start** — run it straight from a clone:
 
@@ -55,6 +55,15 @@ cd weatherpin
 chmod +x weatherpin
 ./weatherpin
 ```
+**If you prefer GitLab** — use these instructions:
+
+```bash
+git clone https://gitlab.com/e1dred/weatherpin.git
+cd weatherpin
+chmod +x weatherpin
+./weatherpin
+```
+
 
 **Install for your user** — so `weatherpin` works from anywhere:
 
@@ -64,7 +73,7 @@ install -Dm755 weatherpin ~/.local/bin/weatherpin
 
 Make sure `~/.local/bin` is on your `PATH` (most distributions already include it).
 
-## Usage
+## ⚙️ Usage
 
 ```bash
 weatherpin                     # start the interactive app
@@ -72,7 +81,7 @@ weatherpin "Northampton, MA"   # start with a search already filled in
 weatherpin --dry-run           # try everything without changing a thing
 ```
 
-### Keys
+### 🔣 Keys
 
 | Screen | Key | Action |
 | --- | --- | --- |
@@ -86,7 +95,7 @@ weatherpin --dry-run           # try everything without changing a thing
 | Add another | `a` / `⏎` | Add another location |
 | Anywhere | `q` | Quit (`Ctrl-C` also works) |
 
-### Options
+### 🔀 Options
 
 | Option | Description |
 | --- | --- |
@@ -98,14 +107,14 @@ weatherpin --dry-run           # try everything without changing a thing
 
 Set `NO_COLOR=1` to turn off colors.
 
-### Good to know
+### ℹ️ Good to know
 
 - When you finish, GNOME Weather is restarted **once** so your new places show up. It's only
   restarted if it was already running.
 - Adding the same place twice is detected and skipped.
 - To remove a location, use GNOME Weather's own interface.
 
-## How it works
+## 💡How it works
 
 1. Your search is sent to [OpenStreetMap Nominatim](https://nominatim.org/).
 2. If nothing matches, a typo-tolerant search ([Photon](https://photon.komoot.io/)) suggests close matches.
@@ -113,13 +122,13 @@ Set `NO_COLOR=1` to turn off colors.
 4. The location is appended to the `locations` key of the `org.gnome.Weather` GSettings schema
    (through `flatpak run --command=gsettings` for Flatpak installs).
 
-## Privacy
+## 🛡️ Privacy
 
 Only the text you search for is sent, to Nominatim and, if needed, Photon. Both are
 free public services run on OpenStreetMap data; please be kind to them and don't script
 bulk lookups. Nothing else leaves your machine, and `weatherpin` keeps no logs or history.
 
-## Troubleshooting
+## ⚠️ Troubleshooting
 
 **"UTF-8 locale" fails in `--check`.** Your terminal isn't using UTF-8. Try
 `export LC_ALL=C.UTF-8` (or `en_US.UTF-8`) and run again.
@@ -134,16 +143,16 @@ services occasionally rate-limit or go down.
 **The new location doesn't show up.** Fully quit and reopen GNOME Weather, or run
 without `--no-restart`.
 
-## Contributing
+## 🤝 Contributing
 
 Bug reports and pull requests are welcome. Please run `bash -n weatherpin` (and
 [`shellcheck`](https://www.shellcheck.net/), if you have it) before submitting.
 
-## License
+## 📜 License
 
 [BSD Zero Clause License (0BSD)](LICENSE) — do whatever you like with it, no attribution required.
 
-## Acknowledgments
+## 🫡 Acknowledgments
 
 - `weatherpin` is a **complete rewrite, not a fork**, inspired by
   [crian/gweather-add-loc](https://github.com/crian/gweather-add-loc). That project had the
