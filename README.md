@@ -73,7 +73,7 @@ install -Dm755 weatherpin ~/.local/bin/weatherpin
 
 Make sure `~/.local/bin` is on your `PATH` (most distributions already include it).
 
-## ⚙️ Usage
+## 💻 Usage
 
 ```bash
 weatherpin                     # start the interactive app
@@ -142,11 +142,6 @@ services occasionally rate-limit or go down.
 
 **The new location doesn't show up.** Fully quit and reopen GNOME Weather, or run
 without `--no-restart`.
-
-## 🤝 Contributing
-
-Bug reports and pull requests are welcome. Please run `bash -n weatherpin` (and
-[`shellcheck`](https://www.shellcheck.net/), if you have it) before submitting.
 
 ## 📜 License
 
