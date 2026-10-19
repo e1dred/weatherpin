@@ -47,13 +47,7 @@ weatherpin --check
 ## 🍺 Install Option #1: Homebrew
 
 ```bash
-brew tap e1dred/tap https://github.com/e1dred/homebrew-tap.git
-brew install weatherpin
-
---or--
-
-brew tap e1dred/tap https://gitlab.com/e1dred/homebrew-tap.git
-brew install weatherpin
+brew install e1dred/tap/weatherpin
 ```
 
 ## 🛠️ Install Option #2: Direct from GitHub/GitLab
