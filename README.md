@@ -50,7 +50,7 @@ weatherpin --check
 brew install e1dred/tap/weatherpin
 ```
 
-## 🛠️ Install Option #2: Direct from GitHub/GitLab
+## ⬇️ Install Option #2: Direct from GitHub/GitLab
 
 **Quick start** — run it straight from a clone:
 
