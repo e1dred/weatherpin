@@ -44,7 +44,7 @@ install command for your distribution:
 ```bash
 weatherpin --check
 ```
-## 🍺 Install Option #1: Homebrew
+## 🍺 Install Option #1: [Homebrew](https://docs.brew.sh/Homebrew-on-Linux) 
 
 ```bash
 brew install e1dred/tap/weatherpin
