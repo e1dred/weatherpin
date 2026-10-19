@@ -44,8 +44,19 @@ install command for your distribution:
 ```bash
 weatherpin --check
 ```
+## 🍺 Install Option #1: Homebrew
 
-## 🛠️ Installation
+```bash
+brew tap e1dred/tap https://github.com/e1dred/homebrew-tap.git
+brew install weatherpin
+
+--or--
+
+brew tap e1dred/tap https://gitlab.com/e1dred/homebrew-tap.git
+brew install weatherpin
+```
+
+## 🛠️ Install Option #2: Direct from GitHub/GitLab
 
 **Quick start** — run it straight from a clone:
 
@@ -54,23 +65,19 @@ git clone https://github.com/e1dred/weatherpin.git
 cd weatherpin
 chmod +x weatherpin
 ./weatherpin
-```
-**If you prefer GitLab** — use these instructions:
 
-```bash
+--or--
+
 git clone https://gitlab.com/e1dred/weatherpin.git
 cd weatherpin
 chmod +x weatherpin
 ./weatherpin
 ```
-
-
 **Install for your user** — so `weatherpin` works from anywhere:
 
 ```bash
 install -Dm755 weatherpin ~/.local/bin/weatherpin
 ```
-
 Make sure `~/.local/bin` is on your `PATH` (most distributions already include it).
 
 ## 💻 Usage
