@@ -19,7 +19,7 @@ fi
 shopt -s extglob
 
 PROG="weatherpin"
-VERSION="0.1.1"
+VERSION="0.2.0"
 SCHEMA="org.gnome.Weather"
 GS_KEY="locations"
 APP_ID="org.gnome.Weather"
@@ -30,10 +30,20 @@ MAX_RESULTS=5
 MIN_COLS=56
 MIN_ROWS=22
 
+# Search results are cached on the user's machine (Nominatim's usage policy
+# requires clients to cache). Per-user, readable only by the user.
+CACHE_DIR="${XDG_CACHE_HOME:-${HOME:+$HOME/.cache}}"
+[ -n "$CACHE_DIR" ] && CACHE_DIR="$CACHE_DIR/$PROG"
+CACHE_HIT_MIN=43200     # answers with results are kept for 30 days
+CACHE_EMPTY_MIN=1440    # "no results" answers are kept for 1 day
+
 DRY_RUN=false
 NO_RESTART=false
 CHECK_ONLY=false
+USE_CACHE=true
+CLEAR_CACHE=false
 INITIAL_QUERY=""
+[ -n "$CACHE_DIR" ] || USE_CACHE=false
 
 # ───────────────────────────── arguments ─────────────────────────────
 
@@ -47,11 +57,14 @@ Options:
   -c, --check       Check that all prerequisites are installed, then exit
   -n, --dry-run     Run the whole flow but don't write anything or restart the app
       --no-restart  Write locations but don't restart GNOME Weather afterwards
+      --no-cache    Don't read or write the local search cache for this run
+      --clear-cache Delete all cached searches, then exit
   -h, --help        Show this help
   -V, --version     Show the version
 
 Environment:
   NO_COLOR                   Disable colours
+  XDG_CACHE_HOME             Where the search cache lives (default: ~/.cache)
   WEATHERPIN_GEOCODER_URL    Override the Nominatim-compatible search endpoint
   WEATHERPIN_FUZZY_URL       Override the Photon-compatible "did you mean" endpoint
 
@@ -67,6 +80,8 @@ while [ $# -gt 0 ]; do
     -c|--check)    CHECK_ONLY=true ;;
     -n|--dry-run)  DRY_RUN=true ;;
     --no-restart)  NO_RESTART=true ;;
+    --no-cache)    USE_CACHE=false ;;
+    --clear-cache) CLEAR_CACHE=true ;;
     -h|--help)     usage; exit 0 ;;
     -V|--version)  echo "$PROG $VERSION"; exit 0 ;;
     --)            shift; INITIAL_QUERY="$*"; break ;;
@@ -325,6 +340,7 @@ run_checks() {
   check_cmd awk awk
   check_cmd stty coreutils
   check_cmd mktemp coreutils
+  check_cmd sha256sum coreutils
 
   # Terminal: UTF-8 locale (box drawing and alignment depend on it)
   local cm; cm=$(locale charmap 2>/dev/null)
@@ -438,16 +454,79 @@ JQ_PHOTON='
   | map(tostring | gsub("[\\x01-\\x1f]"; " "))
   | join("\u001f")'
 
-# http_get MESSAGE URL [curl args...]  — runs curl with a spinner, output → $TMPFILE
+# ── search cache ──
+# Raw service responses are stored per user under $CACHE_DIR, keyed by a hash of
+# the request (URL + parameters, case-insensitive). Files ending in .json hold
+# answers with results; .empty holds "no results" answers, which expire sooner.
+
+# cache_prune — delete expired entries and leftovers from interrupted writes
+cache_prune() {
+  [ -d "$CACHE_DIR" ] || return 0
+  find "$CACHE_DIR" -maxdepth 1 -type f \
+    \( -name '*.json' -mmin +"$CACHE_HIT_MIN" -o -name '*.empty' -mmin +"$CACHE_EMPTY_MIN" \
+       -o -name '*.tmp*' -mmin +60 \) -delete 2>/dev/null
+  return 0
+}
+
+# cache_clear — delete every cached search (only files this script creates)
+cache_clear() {
+  local n=0 f
+  if [ -n "$CACHE_DIR" ] && [ -d "$CACHE_DIR" ]; then
+    while IFS= read -r -d '' f; do
+      rm -f -- "$f" && n=$(( n + 1 ))
+    done < <(find "$CACHE_DIR" -maxdepth 1 -type f \
+               \( -name '*.json' -o -name '*.empty' -o -name '*.tmp*' \) -print0)
+    rmdir "$CACHE_DIR" 2>/dev/null
+  fi
+  echo "Cleared $n cached search(es)."
+}
+
+# cache_lookup BASE — on a fresh hit, copy the saved response to $TMPFILE
+cache_lookup() {
+  local base=$1 ext min
+  for ext in json empty; do
+    if [ "$ext" = json ]; then min=$CACHE_HIT_MIN; else min=$CACHE_EMPTY_MIN; fi
+    [ -s "$base.$ext" ] || continue
+    [ -n "$(find "$base.$ext" -maxdepth 0 -mmin -"$min" 2>/dev/null)" ] || continue
+    cp -- "$base.$ext" "$TMPFILE" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+# cache_store BASE — save the response in $TMPFILE (valid JSON only)
+cache_store() {
+  local base=$1 ext=json tmp="$1.tmp$$"
+  jq -e . "$TMPFILE" >/dev/null 2>&1 || return 0
+  jq -e 'if type == "array" then length > 0 else ((.features // []) | length) > 0 end' \
+    "$TMPFILE" >/dev/null 2>&1 || ext=empty
+  (
+    umask 077                                   # readable by the user only
+    mkdir -p "$CACHE_DIR" && cp -- "$TMPFILE" "$tmp" \
+      && rm -f -- "$base.json" "$base.empty" && mv -f -- "$tmp" "$base.$ext"
+  ) 2>/dev/null || rm -f -- "$tmp" 2>/dev/null
+  return 0
+}
+
+# http_get MESSAGE URL [curl args...]  — runs curl with a spinner, output → $TMPFILE.
+# Served from the local cache when a fresh copy exists; only successful, valid
+# responses are cached.
 http_get() {
-  local msg=$1 url=$2 rc; shift 2
+  local msg=$1 url=$2 rc key base=""; shift 2
   : >"$TMPFILE"
+  if $USE_CACHE; then
+    key=$(printf '%s\0' "${url,,}" "${@,,}" | sha256sum 2>/dev/null | cut -d' ' -f1)
+    if [ -n "$key" ]; then
+      base="$CACHE_DIR/$key"
+      cache_lookup "$base" && return 0
+    fi
+  fi
   curl -fsS --max-time 15 -G -A "$USER_AGENT" "$@" "$url" >"$TMPFILE" 2>/dev/null &
   BG_PID=$!
   render_header 1; blank; printf '\e[J'
   spin "$BG_PID" "$msg"
   wait "$BG_PID"; rc=$?
   BG_PID=""
+  if (( rc == 0 )) && [ -n "$base" ]; then cache_store "$base"; fi
   return $rc
 }
 
@@ -751,6 +830,8 @@ finish() {
 # ───────────────────────────── main ─────────────────────────────
 
 main() {
+  if $CLEAR_CACHE; then cache_clear; exit 0; fi
+  $USE_CACHE && cache_prune
   run_checks
   if $CHECK_ONLY; then
     print_report
