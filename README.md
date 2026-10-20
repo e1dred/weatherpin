@@ -38,7 +38,7 @@ found, and adds it to GNOME Weather. No hunting for latitude and longitude.
 
 You'll also need an internet connection while searching.
 
-Not sure what you have? Run the built-in check. It lists what's missing and prints the
+Not sure what you have? After installation run the built-in check. It lists what's missing and prints the
 install command for your distribution:
 
 ```bash
