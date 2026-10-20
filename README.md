@@ -21,6 +21,7 @@ found, and adds it to GNOME Weather. No hunting for latitude and longitude.
 - **Tidy names.** US states are shown as two-letter abbreviations (`Northampton, MA`).
 - **Add several in one go.** After each location, add another or quit.
 - **Native and Flatpak.** Detects how GNOME Weather is installed and does the right thing.
+- **Easy on free services.** Searches are cached on your computer, so repeating one doesn't contact the search services again.
 - **Safe to try.** `--dry-run` runs the whole flow without writing anything.
 - **Helpful when something's missing.** `--check` tells you exactly what to install.
 
@@ -103,6 +104,8 @@ weatherpin --dry-run           # try everything without changing a thing
 | `-c`, `--check` | Check prerequisites and exit |
 | `-n`, `--dry-run` | Run the full flow but write nothing and restart nothing |
 | `--no-restart` | Add locations but leave GNOME Weather as it is |
+| `--no-cache` | Don't read or write the search cache for this run |
+| `--clear-cache` | Delete all cached searches and exit |
 | `-h`, `--help` | Show help |
 | `-V`, `--version` | Show the version |
 
@@ -113,21 +116,32 @@ Set `NO_COLOR=1` to turn off colors.
 - When you finish, GNOME Weather is restarted **once** so your new places show up. It's only
   restarted if it was already running.
 - Adding the same place twice is detected and skipped.
+- Search results are remembered for 30 days (searches that found nothing, for 1 day), so
+  repeating a search is instant and sends nothing over the network.
 - To remove a location, use GNOME Weather's own interface.
 
 ## 💡How it works
 
-1. Your search is sent to [OpenStreetMap Nominatim](https://nominatim.org/).
-2. If nothing matches, a typo-tolerant search ([Photon](https://photon.komoot.io/)) suggests close matches.
-3. You pick and confirm a result; the coordinates are converted to radians.
-4. The location is appended to the `locations` key of the `org.gnome.Weather` GSettings schema
+1. Your search is looked up in a small cache on your computer. If you've searched for it
+   recently, the saved answer is used and nothing is sent.
+2. Otherwise it's sent to [OpenStreetMap Nominatim](https://nominatim.org/).
+3. If nothing matches, a typo-tolerant search ([Photon](https://photon.komoot.io/)) suggests close matches.
+4. You pick and confirm a result; the coordinates are converted to radians.
+5. The location is appended to the `locations` key of the `org.gnome.Weather` GSettings schema
    (through `flatpak run --command=gsettings` for Flatpak installs).
 
 ## 🛡️ Privacy
 
 Only the text you search for is sent, to Nominatim and, if needed, Photon. Both are
 free public services run on OpenStreetMap data; please be kind to them and don't script
-bulk lookups. Nothing else leaves your machine, and `weatherpin` keeps no logs or history.
+bulk lookups. Nothing else leaves your machine.
+
+To follow Nominatim's usage policy, `weatherpin` caches search results in
+`~/.cache/weatherpin/` (or `$XDG_CACHE_HOME/weatherpin/`). The cache is readable only by
+you and is never sent anywhere. It holds the text you searched for and the results, for up
+to 30 days (1 day for searches that found nothing). Run `weatherpin --clear-cache` to delete
+it, or `--no-cache` to skip it for a single run. Apart from the cache, `weatherpin` keeps no
+logs or history.
 
 ## ⚠️ Troubleshooting
 
@@ -140,6 +154,8 @@ bulk lookups. Nothing else leaves your machine, and `weatherpin` keeps no logs o
 services occasionally rate-limit or go down.
 
 **A place isn't found.** Add a region or country (`Springfield, IL`), or check the spelling.
+
+**Results look out of date.** Run `weatherpin --clear-cache`, or search once with `--no-cache`.
 
 **The new location doesn't show up.** Fully quit and reopen GNOME Weather, or run
 without `--no-restart`.
