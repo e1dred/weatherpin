@@ -166,6 +166,7 @@ without `--no-restart`.
 
 ## 🫡 Acknowledgments
 
+- `weatherpin` was written with [Claude](https://claude.ai), Anthropic's AI assistant.
 - `weatherpin` is a **complete rewrite, not a fork**, inspired by
   [crian/gweather-add-loc](https://github.com/crian/gweather-add-loc). That project had the
   idea of adding custom locations to GNOME Weather through GSettings; this one builds an
