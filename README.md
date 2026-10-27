@@ -13,7 +13,7 @@ found, and adds it to GNOME Weather. No hunting for latitude and longitude.
   <img src="docs/screenshot.png" alt="weatherpin showing a list of matching places for a search, with a sun icon in the header" width="720">
 </p>
 
-## ✨ Features
+## ✨ Features:
 
 - **Search by name.** Type `Northampton, MA`; coordinates are looked up for you.
 - **Confirm before anything changes.** Review the match, rename it, or go back.
